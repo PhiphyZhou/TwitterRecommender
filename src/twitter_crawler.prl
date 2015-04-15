@@ -1,0 +1,533 @@
+#!/usr/bin/perl -w
+
+use warnings; 
+use strict;
+
+use Data::Dumper;
+use Net::Twitter;
+use List::Util qw(min);
+use Scalar::Util qw(looks_like_number);
+use Storable;
+use DateTime; 
+
+#####################################################
+#####################################################
+## TWITTER_CRAWLER
+##
+## A program using Twitter REST API to get the tweets 
+## of a given user, then store them as objects in disk 
+## for further analysis. 
+#####################################################
+#####################################################
+
+#####################################################
+## GLOBAL VARIABLES
+#####################################################
+my $root = "./"; # the root directory 	
+
+# Twitter app authentication 
+# The consumer tokens are taken off for security concerns! 
+my $consumer_key = "";
+my $consumer_secret = "";
+my $nt; # twitter API agent 
+
+# Twitter user account information 
+my($access_token, $access_token_secret,$user_id,$username);
+
+#####################################################
+## RATE LIMITS
+# Twitter API has rate limits in 15 minites for all queries.
+# We need to make sure that the rate limit of calling a query function
+# is not violated. The following hash is for encapsulating the functions, 
+# their rate limits and count of callings, then to use the safe_call() subroutine
+# to call them so that it can make sure the rate limits are not violated.
+#####################################################
+
+my %queries; # the big hash for all functions
+my $aquery; # hash reference for one query
+
+# hash for favorites()
+$aquery = {}; 
+$$aquery{"limit"} = 15; 
+$$aquery{"count"} = 0; 
+$$aquery{"func"} = sub {$nt->favorites(@_)}; 
+$queries{"favorites"} = $aquery; 
+
+# hash for user_timeline()
+$aquery = {}; 
+$$aquery{"limit"} = 180; 
+$$aquery{"count"} = 0; 
+$$aquery{"func"} = sub {$nt->user_timeline(@_)}; 
+$queries{"user_timeline"} = $aquery; 
+
+# hash for show_status()
+$aquery = {}; 
+$$aquery{"limit"} = 180; 
+$$aquery{"count"} = 0; 
+$$aquery{"func"} = sub {$nt->lookup_statuses(@_)}; 
+$queries{"lookup_statuses"} = $aquery; 
+
+# hash for friends_ids()
+$aquery = {}; 
+$$aquery{"limit"} = 15; 
+$$aquery{"count"} = 0; 
+$$aquery{"func"} = sub {$nt->friends_ids(@_)}; 
+$queries{"friends_ids"} = $aquery; 
+
+# hash for show_user()
+$aquery = {}; 
+$$aquery{"limit"} = 180; 
+$$aquery{"count"} = 0; 
+$$aquery{"func"} = sub {$nt->show_user(@_)}; 
+$queries{"show_user"} = $aquery;
+
+# hash for home_timeline()
+$aquery = {}; 
+$$aquery{"limit"} = 15; 
+$$aquery{"count"} = 0; 
+$$aquery{"func"} = sub {$nt->home_timeline(@_)}; 
+$queries{"home_timeline"} = $aquery;
+
+# the time that need to wait if the rate limit is reached 
+my $wait = 15*60; # 15 minutes in unit of seconds
+ 
+#####################################################
+# Date range:
+# The tweets considered are all within a time range(date range),
+# which requires comparing the date when collecting data.
+# The following variables are for this purpose.
+#####################################################
+
+# A hash for converting letter month into number month
+my %month; 
+$month{"Jan"}=1; 
+$month{"Feb"}=2;
+$month{"Mar"}=3;
+$month{"Apr"}=4;
+$month{"May"}=5;
+$month{"Jun"}=6; 
+$month{"Jul"}=7;
+$month{"Aug"}=8;
+$month{"Sep"}=9;
+$month{"Oct"}=10;
+$month{"Nov"}=11;
+$month{"Dec"}=12;
+
+# date hashes for the date range of the recommended tweets
+my %from;
+my %to; 
+
+#####################################################
+## MAIN PROCESS 
+#####################################################
+
+return 1 unless $0 eq __FILE__; # skip main process for the case it's used as a library
+&authentication; 
+&set_date; 
+print "Collecting data...\n"; 
+&collect_interest; 
+&collect_home; 
+
+#####################################################
+## SUB ROUTINES
+#####################################################
+
+#####################################################
+## AUTHENTICATION
+## Twitter uses OAuth for authentication the app and users
+## The user needs to use a given url link to allow this app
+## to access the account. 
+#####################################################
+sub authentication {
+
+	# Twitter API agent
+	$nt = Net::Twitter->new(
+		  traits   => [qw/API::RESTv1_1/],
+		  consumer_key    => $consumer_key,
+		  consumer_secret => $consumer_secret,
+		  ssl                 => 1,
+		); 
+
+	# Twitter user authentication 
+	# If the token and secret are already saved in cookie, config file
+	($access_token, $access_token_secret,$user_id,$username) = restore_tokens();
+	if ($access_token && $access_token_secret) {
+	  $nt->access_token($access_token);
+	  $nt->access_token_secret($access_token_secret);
+	  print "Welcome back ",$username,"!\n"; 
+	}
+
+	unless ( $nt->authorized ) {
+	  # The client is not yet authorized: Do it now
+	  print "Welcome to the Twitter Recommender! 
+		\nPlease go to the following link to authorize this app\n", 
+		$nt->get_authorization_url, "\nand enter the PIN# here: \n";
+
+	  my $pin = <STDIN>; # wait for input
+	  chomp $pin;
+
+	  ($access_token, $access_token_secret, $user_id, $username) = $nt->request_access_token(verifier => $pin);
+	  save_tokens(); # if necessary
+	}
+}
+
+#####################################################
+## SET_DATE
+## Set the starting and ending dates for the recommendation search.
+## The ending date is always today, and the starting date is given
+## by the use (by giving the number of days to trace back).
+##
+## ARGUMENT:
+##	- $range = the date that you want to trace back from today
+#####################################################
+sub set_date {
+	
+	my $range = shift; 
+	
+	my $dt = DateTime->today(); 
+#	print Dumper $dt; 
+	my $year = $$dt{"local_c"}{"year"}; 
+	my $month = $$dt{"local_c"}{"month"}; 
+	my $date = $$dt{"local_c"}{"day"}; 
+	
+	@to{"date","month","year"}=($date,$month,$year); 
+#	 print Dumper \%to; 
+	
+	# Ask the user to input the date range if it's not passed as an argument 
+	if(!defined($range)) { 	
+		print "Please tell me how many days you want the search to trace back from today.\n",
+			"Keep in mind that at most 800 recent tweets can be looked at.\n";  
+		$range = <STDIN>; 
+		while (!looks_like_number($range) || $range<0){
+			print "Please input a positive number: \n"; 
+			$range = <STDIN>; 
+		}
+		$range = int($range); 
+	}
+	
+	$dt->subtract( days => $range );
+	$year = $$dt{"local_c"}{"year"}; 
+	$month = $$dt{"local_c"}{"month"}; 
+	$date = $$dt{"local_c"}{"day"}; 
+	@from{"date","month","year"}=($date,$month,$year); 
+#	 print Dumper \%from; 
+}
+
+#####################################################
+## COLLECT_INTEREST
+## Collect interesting tweets using API query results
+## and store the array of tweets in the disk to be used later.
+## 
+## The interesting tweets for a user include the user's own tweets,
+## the tweets she replied, retweeted or marked as favorite. 
+#####################################################
+sub collect_interest {
+
+	# set the date range of the interesting tweets
+	# It's from 1 month before the "from" date to 1 month after the "to" date
+	my $start = {%from}; # make a copy of the given date
+	my $end = {%to}; 
+	
+	# change the month to make the date range 
+	if($$end{"month"}==12){
+		$$end{"year"}++; 
+		$$end{"month"}=1; 
+	}else{
+		$$end{"month"}++; 
+	}
+	
+	if($$start{"month"}==1){
+		$$start{"year"}--; 
+		$$start{"month"}=12; 
+	}else{
+		$$start{"month"}--; 
+	}
+	
+	# collect favorite tweets
+	print "Collecting favorite tweets...\n"; 
+	# The result of the query is a reference to an array of hashes
+	my $fav = &get_all("favorites",{"screen_name"=>$username,"count"=>200},$start,$end); 
+#	print "Finish collecting favorite tweets.\n";
+	
+	# collect user's timeline tweets
+	print "Collecting user's timeline tweets...\n"; 
+	my $timeline = &get_all("user_timeline",{"screen_name"=>$username,
+		"count"=>200},$start,$end); 
+#	print "Finish collecting user's timeline tweets.\n";
+	
+	# collect retweets and user's own tweets from the timeline
+#	print "Collecting own, retweeted and replied tweets...\n";
+	my (@own, @ret, @rep); 
+	my @re_ids; # the ids of the replied tweets
+	foreach my $i (0..(scalar @$timeline-1)){
+		my $status = $$timeline[$i];
+			
+		# retweeted tweets
+		if($status->{"retweeted_status"}) {
+			push @ret, $status; 
+		}
+		# user's own tweets
+		else {
+			push @own, $status; 
+			# get the tweet id that is replied to 
+			if($status->{"in_reply_to_status_id_str"}) {
+				push @re_ids, $status->{"in_reply_to_status_id_str"};
+			}
+		}
+	}
+#	print "finished collecting own and retweeted.\n";
+	
+	# collect replied tweets
+#	print Dumper \@re_ids; 
+#	print "total: ".(scalar @re_ids)."\n"; 
+	my $s = 0; 
+	while ($re_ids[$s]) {
+#		print $s."\n"; 
+		my @ids = @re_ids[$s .. min($s+99, $#re_ids) ];
+#		print Dumper \@ids; 
+		push @rep, @{&safe_call("lookup_statuses",{"id"=>\@ids})}; 
+		$s += 100; 
+	}
+	
+#	print Dumper \@rep; 
+	
+	print "Number of own tweets: ".(scalar @own)."\n"; 
+	print "Number of retweeted tweets: ".(scalar @ret)."\n"; 
+	print "Number of replied tweets: ".(scalar @rep)."\n"; 
+	
+	# store the tweet arrays into disk
+	store $fav, $root.'cookie/favorite'; 
+	store \@own, $root.'cookie/own'; 
+	store \@ret, $root.'cookie/retweeted'; 
+	store \@rep, $root.'cookie/replied'; 
+}
+
+#####################################################
+## COLLECT_HOME
+## Collect home timeline tweets of the user except user's own tweets
+## and store the hash of tweets in the disk to be used later.
+##  
+## The key of the %home hash is the status id, 
+## and the value is the status reference. 
+#####################################################
+sub collect_home {
+	
+	# collect home_timeline tweets
+	print "Collecting home timeline tweets...\n"; 
+	my $result = &get_all("home_timeline",{"count"=>60},\%from,\%to); 
+	
+	# exclude user's own tweets
+	
+	my %home; 
+	for my $status (@$result) {
+		if($$status{"user"}{"screen_name"} ne $username){
+			$home{$$status{"id"}}=$status; 
+		}
+	}
+	
+	print "Number of home timeline tweets: ".(scalar (keys %home))."\n";	
+
+#	print Dumper \%home; 
+	store \%home, $root.'cookie/home'; 
+}
+
+#####################################################
+## GET_ALL
+## Call the twitter query functions iteratively through pages
+## until it gets all tweets that are in the required date range.
+## It use the safe_call() subroutine to call the query functions.
+##
+## ARGUMENTS:
+##	- $query = a string that is key of %queries corresponding to the function
+##	- $parameter = a hash that is the parameter of the function 
+##	- $start = the date hash reference of the starting date
+##	- $end = the date hash reference of the ending date
+##
+## RETURN:
+##	The reference of query results 
+#####################################################
+sub get_all {
+
+	my $query = shift; 
+	my $parameter = shift; 
+	my $start = shift; 
+	my $end = shift; 
+	
+	my $oldest = {}; #oldest date of a page
+	my $newest = {"year"=>10000}; # newest date of a page, initialized as the maximum year
+	my @all; # all tweets collected
+	
+	# iterate while the page still has some tweets that are after the start date
+	while (&compare_dates($newest, $start)>-1){
+		my $result = &safe_call($query,$parameter); # get the page	
+#		print((scalar @$result)."\n"); 
+		if(!defined $result || scalar @$result == 0){last;} 
+		# $result is undefined usually because the rate limit is reached and 
+		# it chooses not to continue
+		
+#		print Dumper $result; 
+		$newest = &get_date($$result[0]); 
+		$oldest = &get_date($$result[-1]); 
+#		print Dumper $newest; 
+#		print Dumper $oldest; 
+		
+		# if some of the tweets in the page falls in the date range, collect the whole page
+		if(&compare_dates($oldest,$end)<1){
+			push @all, @$result; 
+		}
+		
+		# move to the next page
+		$newest = $oldest; 
+		$$parameter{"max_id"}=$$result[scalar @$result - 1]->{"id"}-1; 
+	}
+	
+	print ("Total number of tweets collected: ".(scalar @all)."\n"); 	
+	return \@all; 	
+}
+
+#####################################################
+## SAFE_CALL
+## Call the twitter query functions safely. 
+## 
+## Before calling, it will check if the rate limit is reached. 
+## If yes, it pauses the program for 15 minutes before making the call.
+## After calling, it will increment the calling count by 1.
+##
+## Note: It can only guarantee that during one execution the rate limit 
+## will not be exceeded, but can't guarantee multiple executions within short time. 
+##
+## ARGUMENTS:
+##	- $query = a string that is key of %queries corresponding to the function
+##	- $parameter = a hash that is the parameter of the function 
+##
+## RETURN:
+##	The reference of query result 
+#####################################################
+sub safe_call {
+
+	my $query = shift; 
+	my $parameter = shift; 
+	
+	# check if the rate limit is reached
+	if($queries{$query}->{"count"}==$queries{$query}->{"limit"}){
+		print "Rate limit is reached for function ".$query.". \n";
+		print "Do you want to wait for 15 minutes?\n";
+		print "Tyep \"y\" for waiting and \"n\" for skipping further data and continue:\n"; 
+		my  $option = <STDIN>;
+		chomp $option;
+		if ("\L$option" eq "y") {
+			print "Waiting for 15 minutes..."; 
+			$queries{$query}->{"count"}=0; # restart the counting 
+			sleep($wait); # pause for 15 minites
+		}else{ 
+			print "Warning: further data skipped!\n"; 
+			return undef; 
+		}
+	}
+	
+	$queries{$query}->{"count"}++; # increment counting 
+#	print $query." is called for ".$queries{$query}->{"count"}." times.\n";
+	return $queries{$query}->{"func"}->($parameter);
+}
+
+#####################################################
+## GET_DATE
+## get the date information of a tweet object.
+## The formate of time in the tweet hash is 
+## "Wed Feb 25 01:01:50 +0000 2015"
+## For simplicity, we don't consider time zone issue.
+##
+## ARGUMENTS:
+##	- $tweet = reference of the tweet hash
+##
+## RETURN:
+##	The reference of the date hash {year, month, date}
+#####################################################
+sub get_date {
+	
+	my $tweet = shift; 
+	
+	my @dayArray = split /\s+/, $tweet->{"created_at"}; 
+	my %date = (); 
+	$date{"year"} = $dayArray[5]; 
+	$date{"date"} = $dayArray[2]; 
+	$date{"month"} = $month{$dayArray[1]};
+	
+	return \%date; 	
+}
+
+#####################################################
+## COMPARE_DATES
+## compare two dates in hash form
+##
+## ARGUMENTS:
+##	- $date1, $date2 = hash refs of two dates
+##
+## RETURN:
+##	-1 if $date1 is before $date2
+##	 0 if $date1 is the same day as $date2
+##	 1 if $date1 is after $date2
+#####################################################
+sub compare_dates {
+	
+	my $date1 = shift; 
+	my $date2 = shift; 
+	
+	if($date1->{"year"}<$date2->{"year"}){
+		return -1; 
+	}elsif($date1->{"year"}>$date2->{"year"}){
+		return 1; 
+	}else{
+		if($date1->{"month"}<$date2->{"month"}){
+			return -1; 
+		}elsif($date1->{"month"}>$date2->{"month"}){
+			return 1; 
+		}else{
+			if($date1->{"date"}<$date2->{"date"}){
+				return -1; 
+			}elsif($date1->{"date"}>$date2->{"date"}){
+				return 1; 
+			}else{
+				return 0; 
+			}
+		}
+	}
+	
+}
+
+#####################################################
+## SAVE_TOKENS
+## Save the user access tokens to disk
+##
+#####################################################
+sub save_tokens {
+
+	my $tokens = [$access_token,$access_token_secret,$user_id,$username]; 
+	store $tokens, $root."cookie/access_tokens"; 
+}
+
+#####################################################
+## RESTORE_TOKENS
+## Retrieve the user access tokens from disk
+##
+## RETURN:
+##	access_token and access_token_secret as an array
+#####################################################
+sub restore_tokens {
+	
+	if(-e $root."cookie/access_tokens"){
+		my $tokens = retrieve($root."cookie/access_tokens");
+		return @$tokens; 
+	}else{
+		return (); 
+	}
+}
+
+
+
+
+
+
+
+
+

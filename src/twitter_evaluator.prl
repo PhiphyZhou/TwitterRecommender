@@ -1,0 +1,275 @@
+#!/usr/bin/perl -w
+
+use warnings; 
+use strict;
+
+use Data::Dumper;
+use List::Util qw(min first sum);
+use Scalar::Util qw(looks_like_number);
+use Storable;
+
+#####################################################
+#####################################################
+## TWITTER_EVALUATOR
+##
+## Evaluate the recommendation model using the user data.
+## It randomly splits the interesting tweets into 7:3 partitions, 
+## uses 70% for recommendation and 30% for testing. 
+## The precision-recall pairs are calculated. 
+#####################################################
+#####################################################
+
+#####################################################
+## GLOBAL VARIABLES
+#####################################################
+
+# statistics 
+my $prec_mean1; # mean of precistions at 0.25, 0.5, 0.75 recall points
+my $prec_mean2; # mean of precision at 0.1, 0.2, ... 1.0 recall points 
+my @prec_rec_4; # precisions at 0.25, 0.5, 0.75, 1.0 recall points
+my $recall_norm; # normalized recall measure
+my $prec_norm; # normalized precision measure
+
+# directory of the data objects to be read and written by the splitter 
+my $root_read; 
+my $root_write; 
+
+#####################################################
+## MAIN PROCESS
+#####################################################
+
+# get the data
+if (scalar @ARGV>0){ # test with the local sample data 
+	$root_read = './sample/'; 
+}else { # use the twitter_crawler to collect user data
+	require './src/twitter_crawler.prl'; 
+	&collect_data; 
+	$root_read = './cookie/'; 
+}
+
+# Split data and store back to disk
+print "Split Data: \n" ; 
+$root_write = './cookie/'; 
+my %test; # hash of the ids of the testing tweets
+my $home_temp = retrieve($root_read.'home'); 
+&split_data('favorite');
+&split_data('retweeted');
+&split_data('replied');
+store $home_temp, $root_write.'home'; 
+	
+# Analyze data
+require './src/twitter_analyzer.prl'; 
+our (@favorites, @retweeted, @replied, @recommend); 
+&init_stop;
+&init_data;
+print "total in test: ", scalar (keys %test), "\n"; 
+print "total in train: ", ((scalar @favorites)+(scalar @retweeted)+(scalar @replied), "\n"); 
+
+# Evaluate individual score model
+print "\nEvaluation for individual score model: \n" ; 
+&sort_indi;
+&comp_prec_recall; 
+print "\n---------------------------------------------\n"; 
+
+# Evaluate profile model
+print "\nEvaluation for profile model: \n" ; 
+&sort_prof; 
+&comp_prec_recall; 
+
+#####################################################
+## COLLECT_DATA
+##
+## use the twitter_crawler to collect data
+#####################################################
+sub collect_data {
+
+	&authentication; 
+	&set_date(30); # the recent 30 days of home timeline tweets are collected
+	&collect_interest; 
+	&collect_home; 
+}
+
+#####################################################
+## SPLIT_DATA
+##
+## Split the interesting tweets into training and testing
+## partitions.
+## Read in the hash objects of favorite, retweeted and 
+## replied tweets, for each of them, take off 30% randomly,
+## add to the home tweet hash, and store their ids for testing. 
+##
+## ARGUMENTS:
+##	$ob = the address of the object file 
+#####################################################
+sub split_data {
+	
+	my $ob = shift; 
+	my $all = retrieve($root_read.$ob); 
+	print "$ob: \nbefore splitting: ", scalar @$all, "\n"; 
+
+	# iterate among the tweets to assign them randomly to training or testing parts
+	srand(0); 
+	my $count=0; 
+	for (my $i=scalar @$all-1; $i>=0; $i--){ 	
+		if(rand(1)<0.3){ # assign to testing. Otherwise remain in training 
+			$test{$$all[$i]->{"id"}}=1; # record the id
+			$$home_temp{$$all[$i]->{"id"}}=$$all[$i]; # move it to %home
+			splice @$all, $i, 1; # remove it from the original list
+			$count++; 
+		}	
+	} 
+	print "after splitting: $count / ", scalar @$all, "\n"; 
+	# write the object back
+	store $all, $root_write.$ob; 
+}
+
+
+#####################################################
+## COMP_PREC_RECALL
+##
+## Compute the precision-recall pairs of the four quartiles. 
+##
+## ARGUMENTS:
+##	
+##	
+#####################################################
+sub comp_prec_recall {
+
+	my @ranks = (); # ranks of the testing tweets
+
+	# get the indices(ranks) of all the testing tweets
+	foreach my $num (keys %test){
+		my $rank = first { $recommend[$_] eq $num } 0..$#recommend;
+		push @ranks, $rank+1; # make rank counting from 1 instead of 0 
+	}
+		
+	# sort ranks of relevant docs 
+	my @sorted_ranks = sort {$a<=>$b} @ranks; 
+	
+	print "ranks of interesting tweets: \n"; 
+	foreach my $num (@sorted_ranks){
+		print $num, " "; 
+	}
+	
+	# calculate recall/precision pairs
+	print "\nrecall/precision pairs: \n"; 
+	my %rec_prec = (); 
+	foreach my $recalled (1 .. scalar @sorted_ranks){
+		my $rank = $sorted_ranks[$recalled-1]; 
+		my $prec = $recalled / $rank;
+		my $recall = $recalled / (scalar @ranks);  
+		$rec_prec{$recall}=$prec; 
+		print $recall, ",", $prec, "\n"; 
+	}
+#	print "recall/precision values: ", Dumper \%rec_prec; 
+#	print "test pr for 0.6: ", &recall_precision(\%rec_prec, 0.6), "\n"; 
+	
+	# precisions at 0.25, 0.5, 0.75, 1.0 recall points
+	@prec_rec_4 = (); 
+	push @prec_rec_4, &recall_precision(\%rec_prec, 0.25);
+	push @prec_rec_4, &recall_precision(\%rec_prec, 0.5);
+	push @prec_rec_4, &recall_precision(\%rec_prec, 0.75);
+	push @prec_rec_4, &recall_precision(\%rec_prec, 1.0);
+	
+	my $prec_sum3 = 0; 
+	print "\nprecisions at quarter points: \n"; 
+	foreach my $temp (@prec_rec_4) {
+		print $temp, "\n"; 
+		$prec_sum3 += $temp;
+	}
+		
+	# Calculate Prec_mean1
+	$prec_sum3 -= $prec_rec_4[3]; 
+	$prec_mean1 = $prec_sum3/3; 
+	print "\nPrec_mean1: ", $prec_mean1, "\n"; 
+	
+	# Calculate Prec_mean2 
+	my $prec_sum10 = 0; 
+	foreach my $i (1...10) {		
+		$prec_sum10 += &recall_precision(\%rec_prec, $i/10); 
+	}
+	$prec_mean2 = $prec_sum10/10; 
+	print "Prec_mean2: ", $prec_mean2, "\n"; 
+	
+	# Calculate Recall_norm
+	my $rank_sum = sum @ranks; 
+	my $rel = scalar @ranks; 
+	my $n = scalar @recommend - 1; 
+	my $sum = sum (1..$rel); 
+	$recall_norm = 1-(($rank_sum-$sum)/($rel*($n-$rel)));
+#	print "sum of ranks: ", $rank_sum, " ", $sum, " ", $rel, " ", $n, "\n"; 
+	print "Recall_norm: ", $recall_norm, "\n"; 
+
+	# Calculate Prec_norm
+	my $rank_log_sum = 0; 
+	my $log_sum = 0; 
+	foreach my $i (0..$#ranks){
+		$rank_log_sum += log($ranks[$i]);
+		$log_sum += log($i+1); 
+	}
+	$prec_norm = 1-(($rank_log_sum-$log_sum)/($n*log($n)-($n-$rel)*log($n-$rel)-$rel*log($rel)));
+	print "Prec_norm: ", $prec_norm, "\n"; 
+
+}
+
+##########################################################
+## recall_precision
+##
+## Given the recall/precision hash table and the required recall value, 
+## compute the corresponding precision using interpolation.
+## 
+##########################################################
+
+sub recall_precision {
+	my $rp_table = shift; 
+	my $recall = shift; 
+	
+#	print Dumper \%{$rp_table};
+	
+	# make a sorted array for the recalls 
+	my @sort_keys = (); 
+	foreach my $key (keys %{$rp_table}) {
+		push @sort_keys, $key; }
+		
+	@sort_keys = sort {$a<=>$b} @sort_keys;
+	
+	foreach my $i (0..$#sort_keys-1) {
+		if ( $recall>=$sort_keys[$i] && $recall<=$sort_keys[$i+1] ){
+			my $a = $$rp_table{$sort_keys[$i]};
+			my $b = $$rp_table{$sort_keys[$i+1]};
+			return $a+($b-$a)*($recall-$sort_keys[$i])/($sort_keys[$i+1]-$sort_keys[$i]);
+		}
+	}
+	
+	# assume precision=1 when recall=0 when expolate to the left
+	if ( $recall<$sort_keys[0] ) {
+		return 1-($recall*(1-$$rp_table{$sort_keys[0]}))/$sort_keys[0];
+	}
+	
+	# special case when there is only 1 relevant document 
+	if ( $recall==1.0){
+			return $$rp_table{$sort_keys[$#sort_keys]};}
+	
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

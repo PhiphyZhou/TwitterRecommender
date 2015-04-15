@@ -1,0 +1,584 @@
+#!/usr/bin/perl -w
+
+use warnings; 
+use strict;
+
+use Carp;
+use FileHandle;
+use Data::Dumper;
+use List::Util qw(min);
+use Scalar::Util qw(looks_like_number);
+use Storable; 
+
+#####################################################
+#####################################################
+## TWITTER_ANALYZER
+##
+## A program that reads the twitter status objects for recommend 
+## tweets for a user according to the previous
+## tweets that the user was interested in. 
+#####################################################
+#####################################################
+ 
+#####################################################
+## GLOBAL VARIABLES
+#####################################################
+
+#****************************************************
+# The root directory 
+my $root = "./cookie/"; 
+
+#****************************************************
+# Number of tweets to recommend to the user
+my $num_rec; 
+
+#****************************************************
+# Term vectors of different types of tweets (array of hashes)
+our @favorites; # tweets that are favorited by the user
+our @retweets; # tweets that are retweeted by the user
+our @replied; # tweets that are replied by the user
+our @own; # the user's own tweets
+our @interest; # the combination of all the above 4 arrays 
+our %home; # the timeline tweets to be sorted: {$id, %vector}
+
+#****************************************************
+# Term weights for different regions of the tweets
+# to be used to build term vectors
+my $wt_plain = 1; # ordinary words
+my $wt_hash = 2; # words in a hashtag 
+my $wt_mention = 2; # user name mentioned
+my $wt_url = 0.2; # url link
+my $wt_poster = 0.1; # the poster of the tweet
+
+#****************************************************
+# Type weights to be multiplied to scores
+my $wt_fav = 1; # basic weight for favorited tweets
+my $wt_rt = 1; # basic weight for retweeted tweets
+my $wt_rp = 1; # basic weight for replied tweets
+my $wt_own = 1; # basic weight for user's own tweets
+my $wt_home = 1; # basic weight for home timeline tweets
+
+#****************************************************
+# Variables for sorting model 
+my %doc_freq; # document frequency of terms
+my %prof_interest; # the profile vector of all interested tweets 
+my %tweet_score; # the {$id, $score} hash for tweets
+our @recommend; # the sorted array of tweet $id by scores 
+my $allTweets; # ref of hash for the entire tweets to be sorted
+my %stopwords_en; # a list of common English words
+my %stopwords_sp; # a list of common Spanish words
+
+#####################################################
+## MAIN PROCESS
+#####################################################
+
+return 1 unless $0 eq __FILE__; # skip main process for the case it's used as a library
+
+# analyze the sample data instead of the user data
+if(scalar @ARGV > 0){
+	$root = './sample/'; 
+}
+
+# Get the number of recommended tweets to be shown
+print "How many tweets do you want to read?\n";
+$num_rec = <STDIN>;
+while(!looks_like_number($num_rec)){
+	print "Please input a positive integer:\n"; 
+	$num_rec = <STDIN>;
+}
+$num_rec = int($num_rec); 
+ 
+print "Looking for recommended tweets...\n";
+
+&init_stop; 
+# print Dumper \%stopwords_en; 
+# print Dumper \%stopwords_sp; 
+
+&init_data; 
+ 
+&sort_prof;
+#&sort_indi;  
+&show_recommendations($num_rec); # show the recommended tweets 
+
+#####################################################
+## SUB ROUTINES
+#####################################################
+
+#####################################################
+## INIT_DATA
+## Read and initialize tweet lists
+#####################################################
+sub init_data {
+	
+	# Build term vectors for different types of tweets 
+	&vec_from_array($root."favorite", \@favorites, $wt_fav); 
+	&vec_from_array($root."own", \@own, $wt_own); 
+	&vec_from_array($root."replied", \@replied, $wt_rp); 
+	&vec_from_array($root."retweeted", \@retweets, $wt_rt); 
+	&vec_from_hash($root."home", \%home, $wt_home); 
+	
+	push @interest, @favorites; 
+	push @interest, @replied; 
+	push @interest, @retweets;  
+	push @interest, @own; 
+	
+	#	print Dumper \@interest; 
+	#	print Dumper \@favorites;	
+	#	print Dumper \@retweets; 
+	#	print Dumper \@replied; 
+	#	print Dumper \@own; 
+	#	print Dumper \%home; 
+	#	print Dumper \%doc_freq; 
+	
+	&compute_TFIDF(\@interest); 
+	&compute_TFIDF(\%home); 
+}
+
+#####################################################
+## INIT_STOP
+## Read and initialize stopword list
+#####################################################
+sub init_stop {
+	
+	my $file_en = "./doc/stopwords_en";
+	my $file_sp = "./doc/stopwords_sp";
+	
+	my $stoplist_en   = new FileHandle $file_en, "r"
+	or croak "Failed open $file_en";
+	
+	my $line = undef;
+	while (defined( $line = <$stoplist_en> )) {
+		chomp $line;
+		$stopwords_en{ $line } = 1;
+	}
+		
+	my $stoplist_sp   = new FileHandle $file_sp, "r"
+	or croak "Failed open $file_sp";
+	
+	$line = undef;
+	while (defined( $line = <$stoplist_sp> )) {
+		chomp $line;
+		$stopwords_sp{ $line } = 1;
+	}
+}
+
+#####################################################
+## VEC_FROM_ARRAY
+## Build term vectors of from an array of tweets 
+## 
+## ARGUMENTS:
+##	$ob = file name of the stored tweet object
+##	$list = the array reference for storing the vectors
+##	$wt = type weight 
+#####################################################
+sub vec_from_array {
+
+	my $ob = shift; 
+	my $list = shift; 
+	my $wt = shift; 
+		
+	my $result = retrieve($ob); 
+	# iterate among the tweets in the result to build term vectors
+	foreach my $i (0..(scalar @$result-1)){	
+		my $vec = &build_vec($$result[$i], $wt);
+		push @$list, $vec; 			
+		&count_doc_freq($vec); 	# also count the document frequencies 	
+	} 
+}
+
+#####################################################
+## VEC_FROM_hash
+## Build term vectors of from a hash of tweets 
+## 
+## ARGUMENTS:
+##	$ob = file name of the stored tweet object
+##	$list = the hash reference for storing the vectors
+##	$wt = type weight 
+#####################################################
+sub vec_from_hash {
+
+	my $ob = shift; 
+	my $list = shift; 
+	my $wt = shift; 
+		
+	$allTweets = retrieve($ob); 
+	# iterate among the tweets in the result to build term vectors
+	foreach my $id (keys %$allTweets){	
+		my $vec = &build_vec($$allTweets{$id}, $wt);
+		$$list{$id}=$vec; 			
+		&count_doc_freq($vec); 	# also count the document frequencies 	
+	} 
+}
+
+#####################################################
+## BUILD_VEC 
+## Build a tweet vector from a tweet object 
+##
+## ARGUMENTS: 
+##	$tweet = the reference of tweet object
+##	$type_weight = the type weight for this tweet
+##
+## RETURN: the reference of the hashtable of term vector
+#####################################################
+sub build_vec {
+	
+	my $tweet = shift; # ref of a hashtable 
+	my $type_weight = shift; # the type weight 
+	
+	# decide which stopword list to use according to language 
+	my $lang = $tweet->{"lang"}; 
+	my $stoplist = {}; 
+	if($lang eq "en"){
+		$stoplist = \%stopwords_en; 
+	}elsif($lang eq "es"){
+		$stoplist = \%stopwords_sp;
+	}
+	
+#	print "\nlanguage: $lang\n";
+	
+#	my %stoplist = (%stopwords_en, %stopwords_sp); 
+	
+	my $text = $tweet->{"text"};
+#	print "Original text: $text\n"; 
+	my %vec = (); 
+	my @words = split " ", $text;
+	foreach my $w (@words) {
+	
+		$w = lc($w);  # change to lower cases
+		# remove punctuations at the end of a term
+		$w =~ s/[[:punct:]]$//;
+		
+		# assign different weights for different regions
+		if($w eq "rt") { # retweet
+#			$vec{$w} = $wt_rt * $type_weight; 
+			next; 
+		}elsif($w =~ /^@/) { # mention some user
+			$vec{$w}=$wt_mention * $type_weight; 
+		}elsif($w =~ /^#/) { #hashtag
+			$w =~ s/^#//;
+			$vec{$w}=$wt_hash * $type_weight; 
+		}elsif($w =~ /^http/) { #url. All url are considered identical 
+#			$vec{"http"} += $wt_url * $type_weight; 
+			next; 
+		}else {
+			$w =~ s/^[[:punct:]]//; # remove beginning punct for plain words
+			# check if it's stopword in English or Spanish 
+			if(exists($$stoplist{$w})) {
+#				print "stopword: $w\n";
+				next;
+			}
+			if($w ne ""){
+				$vec{$w} += $wt_plain * $type_weight;	
+			}			
+		}
+	} 
+	
+	# add poster to the vector
+	my $poster = $$tweet{"user"}{"screen_name"};
+	$vec{"@".$poster}+=$wt_poster*$type_weight; 
+
+#	print "Term vector: \n";
+#	print Dumper \%vec; 
+	return \%vec; 
+}
+
+#####################################################
+## COMPUTE_TFIDF
+## Modify TF to TF IDF weighting for a given array of vectors
+##
+## ARGUMENTS:
+##	$vecs = array ref or hash ref of the vectors
+##
+## RETURN:
+##	$vecs = the array ref or hash ref with modified weighting 
+#####################################################
+sub compute_TFIDF {
+	
+	my $vecs = shift; 
+	
+	# total document number for all tweets seen 
+	my $doc_num = scalar @interest + scalar (keys %home);
+	my %idf; # inverted document frequency
+
+	# change DF to log_2(IDF)
+	foreach my $w (keys %doc_freq) {
+		$idf{$w} = log($doc_num/$doc_freq{$w})/log(2); 
+	}
+	
+	# Multiply TF by IDF
+	if(ref $vecs eq "ARRAY"){ # the input is an array
+		for my $i (0..$#{$vecs}){
+			for my $w (keys %{$$vecs[$i]}){
+				# "smoothing": if the word is not in %doc_freq, 
+				 # count the DF as 1.
+				if(!exists $idf{$w}) {
+					$idf{$w} = log($doc_num)/log(2); 
+				}
+				$$vecs[$i]->{$w} *=  $idf{$w};			
+			}
+		}
+	}else{ # the input is a hash
+		for my $id (keys %{$vecs}){
+			for my $w (keys %{$$vecs{$id}}){
+				# "smoothing": if the word is not in %doc_freq, 
+				 # count the DF as 1.
+				if(!exists $idf{$w}) {
+					$idf{$w} = log($doc_num)/log(2); 
+				}
+				$$vecs{$id}{$w} *=  $idf{$w};			
+			}
+		}
+	}
+#	print Dumper $vecs; 
+	
+	return $vecs; 
+}
+
+#####################################################
+## COUNT_DOC_FREQ
+## Accumulatively count doc_freq given a tweet
+##
+## ARGUMENTS:
+##	$vec = the hashref of the vector of one document(tweet)
+##################################################### 
+sub count_doc_freq {
+	my $vec = shift; 
+	foreach my $w (keys %{$vec}){
+		if($w !~ /^@/ && $w !~ /^#/ && $w !~ /^http/){
+			$doc_freq{$w} ++; 
+		}
+	}
+}
+
+##########################################################
+## COMPUTE_PROFILE
+## Compute the profile(central) of set of term vectors  
+##
+## ARGUMENTS:
+##	$vecs_ref = the array ref of given vectors
+##
+## RETURN:
+##	$prof = the profile vector hash ref 
+##########################################################
+sub compute_profile{
+	
+	my $vecs_ref = shift; 
+	
+	my @vecs = @{$vecs_ref};
+	my %Vsum; 
+	my %prof; 
+	
+	# sum of all vectors 
+	for my $num (0..$#vecs){
+		foreach my $word (keys $vecs[$num]){
+			$Vsum{$word}+=$vecs[$num]{$word}; 
+		}
+	}
+
+	# take the average over document numbers 
+	foreach my $word (keys %Vsum){
+		$prof{$word}=$Vsum{$word}/$#vecs;
+	}
+	
+	# take a look at the ordered terms of the profile
+# 	print "The sorted profile of interesting tweets: \n"; 
+# 	my @sorted_terms = sort { $prof{$b} <=> $prof{$a} } keys %prof;
+# 	for my $i (0..$#sorted_terms){
+# 		print $sorted_terms[$i]." ".$prof{$sorted_terms[$i]}."\n"; 
+# 	}
+		
+	return \%prof; 
+	
+}
+
+###########################################################
+## COMPUTE_SCORE
+## Compute the score of one term vector. 
+##
+## The score is defined as the sum of all the inverse similarity 
+## between the "home" vector of all the "interest" vectors. 
+## The score is also multiplied by a type weight that decide how
+## important this type is for making the decision. 
+##
+## ARGUMENTS:
+##	$vec = the given "home" vector
+########################################################## 
+sub compute_score {
+
+	my $vec = shift; 
+	
+	my $score = 0; 
+	for my $t (@favorites){
+		$score += &simila($t, $vec, "cos")*$wt_fav;
+	}
+	for my $t (@replied){
+		$score += &simila($t, $vec, "cos")*$wt_rp;
+	}
+	for my $t (@retweets){
+		$score += &simila($t, $vec, "cos")*$wt_rt;
+	}
+	for my $t (@own){
+		$score += &simila($t, $vec, "cos")*$wt_own;
+	}
+	return $score; 
+}
+
+###########################################################
+## SORT_PROF
+##
+## Compute and sort the similarities between the home tweets and the profile
+## of the interest tweets
+##
+## The tweet IDs are listed in array @recommend by descending order of similarities
+########################################################## 
+sub sort_prof {
+
+	%prof_interest = %{&compute_profile(\@interest)};
+	
+    my $tot_number = scalar (keys %home);
+
+   	%tweet_score = (); 
+
+    for my $t (keys %home){
+    	$tweet_score{$t} = &simila($home{$t},\%prof_interest,"cos");    	
+#    	print $t."\n"; 
+    }
+
+    @recommend = 
+      sort {($tweet_score{$b} <=> $tweet_score{$a})} keys %tweet_score;
+      
+#    print Dumper \@recommend; 
+}
+
+###########################################################
+## SORT_indi
+##
+## Compute and sort the sum of the similarity between the home tweets
+## and the individual interesting tweets
+##
+## The tweet IDs are listed in array @recommend by descending order of scores
+########################################################## 
+sub sort_indi {
+
+    my $tot_number = scalar (keys %home);
+
+   	%tweet_score = (); 
+
+    for my $t (keys %home){
+    	my $rt_count = $$allTweets{$t}{"retweet_count"}; 
+    	# increase score for popular tweets
+    	$tweet_score{$t} = &compute_score($home{$t}) + $rt_count/100;
+    	
+#    	print $t."\n"; 
+    }
+
+    @recommend = 
+      sort {($tweet_score{$b} <=> $tweet_score{$a})} keys %tweet_score;
+      
+#    print Dumper \@recommend; 
+}
+
+########################################################
+## SHOW_RECOMMENDATIONS
+## Print the text of recommended tweets in order of similarity.
+## 
+## ARGUMENTS:
+##	$num = the number of recommended tweets to show
+########################################################
+sub show_recommendations {
+	
+	my $num = shift; 
+	
+	print "\nHere are the recent tweets you may like: \n"; 
+	for my $i (0..min($num-1, $#recommend)){
+		my $tweet = $$allTweets{$recommend[$i]};
+		my $text = $tweet->{"text"}; 
+		my $poster = $$tweet{"user"}{"screen_name"};
+		my $score = $tweet_score{$recommend[$i]};
+		my $time = $$tweet{"created_at"};
+		print "\n"; 
+#		print $score, "\n";
+		print "@".$poster.": \n$time \n$text \n"; 
+	}
+}
+    
+########################################################
+## SIMILA
+## Computes the similarity for two vectors represented as hashes.
+##
+## ARGUMENTS:
+##	$vec1, $vec2 = vectors as hashe refs
+##	$type = the type of similarity, "cos"(default) or "dice". 
+## 
+## RETURN: 
+##  the similarity as a scalar 
+########################################################
+sub simila{
+
+    my $vec1 = shift;
+    my $vec2 = shift;
+    my $type = shift; 
+    
+    # empty vectors have 0 similarity 
+    if(!%{$vec1} || !%{$vec2}){
+    	return 0; 
+    }
+
+#	print Dumper $vec1;
+#	print Dumper $vec2;
+	
+    my $num     = 0;
+    my $sum_sq1 = 0;
+    my $sum_sq2 = 0;
+
+    my @val1 = values %{ $vec1 };
+    my @val2 = values %{ $vec2 };
+
+    # determine shortest length vector. This should speed 
+    # things up if one vector is considerable longer than
+    # the other (i.e. query vector to document vector).
+
+    if ((scalar @val1) > (scalar @val2)) {
+	my $tmp  = $vec1;
+	   $vec1 = $vec2;
+	   $vec2 = $tmp;
+    }
+
+    # calculate the cross product
+
+    my $key = undef;
+    my $val = undef;
+
+    while (($key, $val) = each %{ $vec1 }) {
+	$num += $val * ($$vec2{ $key } || 0);
+    }
+
+    # calculate the sum of squares
+
+    my $term = undef;
+
+    foreach $term (@val1) { $sum_sq1 += $term * $term; }
+    foreach $term (@val2) { $sum_sq2 += $term * $term; }
+	if ($type eq "dice") {
+		return (2*$num/($sum_sq1+$sum_sq2)); 
+	} else {
+#		print $sum_sq1." ".$sum_sq2."\n"; 
+		if($sum_sq1==0 || $sum_sq2==0){return 0;}
+    	return ( $num / sqrt( $sum_sq1 * $sum_sq2 ));
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

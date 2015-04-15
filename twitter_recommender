@@ -1,0 +1,46 @@
+#!/bin/sh
+
+# Usage info
+show_help() {
+cat << EOF
+Usage: ./${0##*/} [-option] 
+Options:
+    -h          display this help and exit
+    -s			run the app offline on local sample data
+    -e          evaluate the app online with the user data (account login required)
+    -t          evaluate the app offline using the given sample data (no login required)
+    -c          clean the cookie
+EOF
+}
+
+OPTIND=1 # Reset is necessary if getopts was used previously in the script. 
+while getopts "hcets" opt; do
+    case "$opt" in
+        h)
+            show_help
+            exit 0
+            ;;
+        c)  rm -rf cookie/*
+        	echo "cookie cleaned!" 
+        	exit 0
+            ;;
+        e)  perl ./src/twitter_evaluator.prl
+        	exit 0
+            ;;
+        t)  perl ./src/twitter_evaluator.prl test
+        	exit 0
+            ;;
+        s)  perl ./src/twitter_analyzer.prl sample
+        	exit 0
+            ;;
+        '?')
+            show_help >&2
+            exit 1
+            ;;
+    esac
+done
+shift "$((OPTIND-1))" # Shift off the options and optional --.
+
+# Execute the main functionality when no option is given 
+perl ./src/twitter_crawler.prl
+perl ./src/twitter_analyzer.prl

@@ -1,0 +1,123 @@
+*****************************************************************************
+                            * Twitter Recommender *
+*****************************************************************************
+Author: Xiaozhou Zhou
+All rights reserved. 
+
+--------------------------------------------------------------------------------
+* Introduction
+--------------------------------------------------------------------------------
+This application is for recommending recent tweets from the user's home timeline (ie, the tweets posted by the accounts that the user follows) that the user may be most interested in, according to the tweets that the user has posted, retweeted, favorited and replied. This is especially useful for users who follows a lot of accounts but doesn't have time to read all the tweets they post. 
+
+--------------------------------------------------------------------------------
+* Contents
+--------------------------------------------------------------------------------
+The folder has the following contents:
+
+twitter_recommender - the executable file for this application 
+/src: source files in perl
+	twitter_crawler.prl - the perl code for downloading tweet data via Twitter API
+	twitter_analyzer.prl - the perl code for analyzing the data and make recommendations
+	twitter_evaluator.prl - the perl code for evaluating the models
+/doc: stopword list in both English and Spanish
+/cookie: the folder for storing the data files (as perl objects) generated at run time
+/sample: the local data files (perl objects) for offline test
+/output: the output and plot for the sample data
+
+--------------------------------------------------------------------------------
+* Usage
+--------------------------------------------------------------------------------
+Usage: ./twitter_recommender [-option]
+
+To run the recommender itself, in the root directory, type the command line:
+./twitter_recommender
+
+If it's the first time you use this app, it will prompt to ask you to authorize the app with your twitter account. To do it, go to the given link (by copy and paste it in your browser), log in, and click "Authorize app", then copy and paste the pin number in the terminal. After that, your account information will be stored in cookie, and you don't need to do the authorization again unless you cleaned your cookie (see below). 
+
+Then enter a positive number to indicate how many days you want to trace back from today. The app will look for tweets within the given days. But keep in mind that twitter only allow the API to get at most 800 recent tweets from the timeline, so if the desired tweet pool has more than 800 tweets, it will be truncated to the newest 800. 
+
+Then enter a number indication how many tweets you want to see. It will show you such number of highest ranked tweets with the poster's user name, posting time and text content. 
+
+If you don't have a twitter account, you can still play with it and evaluate the models with the provided local sample data. Please see the options below. 
+
+There are other options you can choose: 
+
+	-h	display the help message
+    	It will clean all contents including the access tokens in folder /cookie
+    -s	run the app on local sample data
+    	Same as running without option but it works on the local data in /sample.
+    -e	evaluate the app online (user authorization required)
+    	It first get the user data online and calculate the statistics of the models.
+    	See Evaluation section for more details
+    -t  test the app offline (no authorization required) 
+    	Same as -e but it does not use the online data. Instead it uses the data in the 
+    	/sample folder and user account authorization is not needed.
+    -c  clean the cookie. 
+
+--------------------------------------------------------------------------------
+* Model
+--------------------------------------------------------------------------------
+The recommendation is based on the user's interests, and the interest is assumed to be represented by how much the user interacts with the tweets, which is expressed by replying, retweeting or favoriting a tweet. And the user's own posts are also considered to be related to her interests[1]. For these consideration, this application is modeled on the user's own tweets, tweets that she retweets, replies and likes. 
+
+The recommendation problem is neither a pure search query problem nor a pure classification problem. It's something in between. It's similar to the query problem in that both calculate the similarity of each candidate and rank them in descent order, but recommendation is not based on a single query, but a bunch of "queries". It's similar to classification problem in that you need to identify the class of a tweet as "interesting" or "not interesting" for the user, however, we only have training data for one class: "interesting", but not for the other "not interesting" class[2]. 
+
+For the above reason, I choose to use the Vector Profile Model, as in homework 3. The profile (vector centroid) of the interesting tweets is computed and the candidate tweets are ordered by their cosine similarities with the profile. 
+
+The term vector of a tweet is built based on its text and author, with the weights:
+$wt_plain = 1; # ordinary words
+$wt_hash = 2; # words in a hashtag 
+$wt_mention = 2; # user name mentioned
+$wt_poster = 0.1; # the poster of the tweet
+
+There is some concerns with this model. Since the user may be interested in multiple topics and their vectors can be far away in the vector space, so the profile can be not close to any of the topics, which leads to poor recommendation with tweets that are not very relevant to any of them. 
+
+So I tried another model: Individual Score Model. Instead of evaluating the similarity with the single profile, it computes the similarity with each one of the interesting tweets and sums them up to get a score for each candidate. It is expected to work better for multiple topics. However, it works worse for the sample data. So I gave it up for doing the real recommendation. 
+
+**********
+[1] The assumption that a user's interests are represented by her action with the tweets is not fully correct. If possible that the user has no action on twitter even if the tweets interest her a lot or she just acts selectively on some topics but not other ones. This is an intrinsic limit that cannot be improved with current resources because there's no other way to know what the user may think just by looking at her twitter account. 
+
+[2] A side note on the "not interesting" class:
+It's not practical to collect all the tweets that the user did not interact with which were posted some time before due to the restriction of twitter API (see more details in Twitter REST API issues). More importantly, they are not really "labeled" as "not interesting" since the user may as well not even see them. So it's not a good idea to model it as a classification problem as if we have two well labeled classes. 
+
+--------------------------------------------------------------------------------
+* Evaluation
+--------------------------------------------------------------------------------
+The evaluation is done by splitting the "interesting" tweets into 7:3 partitions. 70% is used for training (calculating the profile), and the other 30% are mixed into the candidate tweets. Then it's evaluated by looking at the rank of the 30% interesting tweets within the candidates to see how well they can be recalled. The recall-precision values and other statistics are calculated for evaluation. Please see the /output folder for printout of the statistics and the plot for recall-precision curve. 
+
+Both the Vector Profile Model and the Individual Score Model are evaluated. Although only the profile model is used for the application. 
+
+As indicated in Usage, you can either evaluate it online or offline. The evaluation is made online because the models may not be equally good/bad for different users. In fact the Profile model is better than I expected on the sample data maybe because that the sample data is largely focused on a single topic, but this may not be the case for all users. 
+
+--------------------------------------------------------------------------------
+* Twitter REST API issues
+--------------------------------------------------------------------------------
+This app uses Twitter REST API (perl interface: Net::Twitter) to collect the tweets online. It's difficult to use an ordinary robot for crawling the twitter website because the pages are not loaded fully at once and you need to scroll for further loadings. Twitter REST API is handy in getting data, but there are some limitations:
+
+- Rate limits
+All query functions in Twitter API have limited number of calling within 15 minutes, when the limit is reached, the program will terminate and you have to wait for 15 minutes before you make other function calls of the same query. 
+
+I've implemented a "safe_call" mode for calling these functions such that when the rate limit is reached, the user can choose in the command line either to wait for 15 minutes (pause the program) or abandon the collecting of further data and continue. However, the "safe_call" mode can only guarantee that within one running of the program, it will not be terminated by the rate limit. If you run the app (in online mode) for several times in a short time, the number of function calls may still accumulate to reach the limit and thus let the program be terminated. 
+
+- Timeline status limit
+The query function for getting home timeline tweets is limited to return the most recent 800 statuses, and the query function for getting user's own timeline is limited to 3200 recent statuses. So if the user follows a lot of accounts and have a lot of new tweets one the home timeline, it may not be sufficient to get all the tweets of the most recent day. 
+
+A more useful app should use the STREAM API that keeps collecting the new tweets all the time and store then in the cookie for analysis. 
+
+--------------------------------------------------------------------------------
+* Possible Improvements/Extensions
+--------------------------------------------------------------------------------
+Here are some improvements and extensions that I would like to try should I have more time:
+
+1. For multiple topics, the best way is first doing clustering on the topics, then calculate the similarity with each topic and rank the candidates accordingly. The ranking and recommendation can even be done for each topic so that it has a good diversity for the user. 
+
+2. More features can be used such as url links that the tweets contain, and what kind of links (picture, video or article), and if possible, we can even dig into the link to see its content. 
+
+3. Now all the weights are set by hand. We can find a way to train the weights based on the user data, and each user or the same user in different time can get different parameters because the shift of behavior. Online learning is a good choice. 
+
+4. In order to get more and deeper data, we need to use Twitter's STREAM API instead of REST API that allows the updated tweets coming in continuously. This is also necessary for online learning. 
+
+--------------------------------------------------------------------------------
+* Privacy disclaimer 
+--------------------------------------------------------------------------------
+Twitter API uses OAuth to authorize the app. The access tokens are generated when you authorize to access your twitter account and can be used only by this app. 
+Your account password will NEVER be seen by the app. 
